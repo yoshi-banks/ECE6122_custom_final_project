@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <thread>
+#include <chrono>
 
 #include "Logger.hpp"
 #include "TerrainServerOpenTopo.hpp"
@@ -23,7 +24,11 @@ Logger logger("TerrainServerOpenTopo.log");
 TerrainServerOpenTopo::TerrainServerOpenTopo(const std::string& cache_directory,
                                              const std::string& api_base_url,
                                              const std::string& dataset_name)
-    : cache_dir(cache_directory), api_url(api_base_url), dataset(dataset_name)
+    : cache_dir(cache_directory)
+    , api_url(api_base_url)
+    , dataset(dataset_name)
+    , interpolationTolerance_(0.01) // Default tolerance ~1km
+    
 {
     logger.log("[INFO] TerrainServerOpenTopo initialized with dataset: " + dataset);
     if (!fs::exists(cache_dir))
@@ -34,6 +39,10 @@ TerrainServerOpenTopo::TerrainServerOpenTopo(const std::string& cache_directory,
 
     // Initialize CURL
     curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    // Load all existing caches
+    loadAllCaches();
+    logger.log("[INFO] Loaded " + std::to_string(loadedCaches_.size()) + " cached datasets.");
 }
 
 TerrainServerOpenTopo::~TerrainServerOpenTopo()
@@ -68,7 +77,7 @@ bool TerrainServerOpenTopo::loadFromCache(const std::string& filename, std::vect
         return false;
     }
 
-    try 
+    try
     {
         std::ifstream file(filename);
         json j;
@@ -234,17 +243,25 @@ std::vector<TerrainPoint> TerrainServerOpenTopo::getTerrainData(const BoundingBo
                                                                 int grid_points_lat, 
                                                                 int grid_points_lon)
 {
+    return getTerrainDataSmart(bbox, grid_points_lat, grid_points_lon);
+}
+
+std::vector<TerrainPoint> TerrainServerOpenTopo::pygetTerrainDataSmart(const BoundingBox& bbox,
+                                                                     int grid_points_lat,
+                                                                     int grid_points_lon)
+{
     std::string cache_file = getCacheFilename(bbox, grid_points_lat, grid_points_lon);
 
-    // Try to load from cache
+    // Try to load exact match from cache
     std::vector<TerrainPoint> points;
     if (loadFromCache(cache_file, points))
     {
+        std::cout << "Loaded exact match from cache" << std::endl;
         return points;
     }
 
-    // Generate grid of lat/lon points
-    std::vector<std::pair<double, double>> locations;
+    // Generate requested grid points
+    std::vector<std::pair<double, double>> requested_locations;
     double lat_step = (bbox.max_lat - bbox.min_lat) / (grid_points_lat - 1);
     double lon_step = (bbox.max_lon - bbox.min_lon) / (grid_points_lon - 1);
 
@@ -254,23 +271,81 @@ std::vector<TerrainPoint> TerrainServerOpenTopo::getTerrainData(const BoundingBo
         {
             double lat = bbox.min_lat + i * lat_step;
             double lon = bbox.min_lon + j * lon_step;
-            locations.push_back({lat, lon});
+            requested_locations.push_back({lat, lon});
         }
     }
 
-    std::cout << "Querying " << locations.size() << " points from API..." << std::endl;
-    logger.log("[INFO] Querying " + std::to_string(locations.size()) + " points from API...");
+    // Try to interpolate from existing caches
+    std::vector<TerrainPoint> interpolated_points;
+    std::vector<std::pair<double, double>> missing_locations;
+    int interpolated_count = 0;
 
-    // Query API in batches
-    points = queryAPIBatched(locations);
-
-    // Save to cache
-    if (!points.empty())
+    for (const auto& loc : requested_locations)
     {
-        saveToCache(cache_file, points);
+        bool found = false;
+
+        // Check all loaded caches
+        for (const auto& cache : loadedCaches_)
+        {
+            if (canInterpolatePoint(loc.first, loc.second, cache))
+            {
+                TerrainPoint pt;
+                pt.lat = loc.first;
+                pt.lon = loc.second;
+                pt.alt = interpolateElevation(loc.first, loc.second, cache);
+                interpolated_points.push_back(pt);
+                interpolated_count++;
+                found = true;
+                break;
+            }
+        }
+
+        if (!found)
+        {
+            missing_locations.push_back(loc);
+        }
     }
 
-    return points;
+    std::cout << "Interpolated " << interpolated_count << " points from "
+              << loadedCaches_.size() << " cached datasets\n";
+    logger.log("[INFO] Interpolated " + std::to_string(interpolated_count) + " points from cache");
+
+    // Fetch missing data from API
+    if (!missing_locations.empty())
+    {
+        std::cout << "Fetching " << missing_locations.size() << " missing points from API...\n";
+        logger.log("[INFO] Fetching " + std::to_string(missing_locations.size()) + " missing points from API");
+
+        std::vector<TerrainPoint> fetched_points = queryAPIBatched(missing_locations);
+        interpolated_points.insert(interpolated_points.end(),
+                                   fetched_points.begin(),
+                                   fetched_points.end());
+    }
+
+    // Sort points to match original grid order
+    std::sort(interpolated_points.begin(), interpolated_points.end(),
+        [](const TerrainPoint& a, const TerrainPoint& b) {
+            if (std::abs(a.lat - b.lat) < 1e-6)
+                return a.lon < b.lon;
+            return a.lat < b.lat;
+        });
+
+    // Save to cache for future use
+    if (!interpolated_points.empty())
+    {
+        saveToCache(cache_file, interpolated_points);
+
+        // Add to loaded caches
+        CachedDataset new_cache;
+        new_cache.bbox = bbox;
+        new_cache.grid_lat = grid_points_lat;
+        new_cache.grid_lon = grid_points_lon;
+        new_cache.points = interpolated_points;
+        new_cache.filename = cache_file;
+        loadedCaches_.push_back(new_cache);
+    }
+
+    return interpolated_points;
 }
 
 void TerrainServerOpenTopo::exportToCSV(const std::vector<TerrainPoint>& points, const std::string& filename)
@@ -437,4 +512,191 @@ void TerrainServerOpenTopo::startServer(int port)
             close(clientSocket);
         }).detach();
     }
+}
+
+// ============================================================================
+// Cache Management Functions
+// ============================================================================
+
+std::vector<std::string> TerrainServerOpenTopo::findAllCacheFiles()
+{
+    std::vector<std::string> cache_files;
+
+    if (!fs::exists(cache_dir))
+    {
+        return cache_files;
+    }
+
+    for (const auto& entry : fs::directory_iterator(cache_dir))
+    {
+        if (entry.is_regular_file() && entry.path().extension() == ".json")
+        {
+            cache_files.push_back(entry.path().string());
+        }
+    }
+
+    return cache_files;
+}
+
+void TerrainServerOpenTopo::loadAllCaches()
+{
+    loadedCaches_.clear();
+    std::vector<std::string> cache_files = findAllCacheFiles();
+
+    for (const auto& filename : cache_files)
+    {
+        CachedDataset cache;
+        if (loadFromCache(filename, cache.points))
+        {
+            cache.bbox = parseBBoxFromFilename(filename);
+            cache.filename = filename;
+
+            // Extract grid size from filename (format: terrain_lat1_lat2_lon1_lon2_NxM.json)
+            size_t grid_pos = filename.find_last_of("_");
+            size_t ext_pos = filename.find_last_of(".");
+            if (grid_pos != std::string::npos && ext_pos != std::string::npos)
+            {
+                std::string grid_str = filename.substr(grid_pos + 1, ext_pos - grid_pos - 1);
+                size_t x_pos = grid_str.find('x');
+                if (x_pos != std::string::npos)
+                {
+                    cache.grid_lat = std::stoi(grid_str.substr(0, x_pos));
+                    cache.grid_lon = std::stoi(grid_str.substr(x_pos + 1));
+                }
+            }
+
+            loadedCaches_.push_back(cache);
+        }
+    }
+}
+
+BoundingBox TerrainServerOpenTopo::parseBBoxFromFilename(const std::string& filename)
+{
+    BoundingBox bbox = {0, 0, 0, 0};
+    
+    // Extract bbox from filename format: terrain_lat1_lat2_lon1_lon2_NxM.json
+    size_t start = filename.find("terrain_");
+    if (start == std::string::npos) return bbox;
+    
+    start += 8; // Skip "terrain_"
+    
+    std::vector<double> values;
+    std::string num_str;
+    bool negative = false;
+    
+    for (size_t i = start; i < filename.size(); ++i)
+    {
+        char c = filename[i];
+        
+        if (c == '-')
+        {
+            if (!num_str.empty())
+            {
+                values.push_back(negative ? -std::stod(num_str) : std::stod(num_str));
+                num_str.clear();
+            }
+            negative = true;
+        }
+        else if (c == '_' || c == 'x' || c == '.')
+        {
+            if (!num_str.empty())
+            {
+                values.push_back(negative ? -std::stod(num_str) : std::stod(num_str));
+                num_str.clear();
+                negative = false;
+            }
+            if (c == 'x' || c == '.') break; // Stop at grid size
+        }
+        else if (std::isdigit(c) || c == '.')
+        {
+            num_str += c;
+        }
+    }
+    
+    if (values.size() >= 4)
+    {
+        bbox.min_lat = values[0];
+        bbox.max_lat = values[1];
+        bbox.min_lon = values[2];
+        bbox.max_lon = values[3];
+    }
+    
+    return bbox;
+}
+
+// ============================================================================
+// Interpolation Functions
+// ============================================================================
+
+bool TerrainServerOpenTopo::canInterpolatePoint(double lat, double lon, const CachedDataset& cache)
+{
+    // Check if point is within bbox with tolerance
+    if (lat < cache.bbox.min_lat - interpolationTolerance_ ||
+        lat > cache.bbox.max_lat + interpolationTolerance_ ||
+        lon < cache.bbox.min_lon - interpolationTolerance_ ||
+        lon > cache.bbox.max_lon + interpolationTolerance_)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+double TerrainServerOpenTopo::interpolateElevation(double lat, double lon, const CachedDataset& cache)
+{
+    return bilinearInteropolation(lat, lon, cache);
+}
+
+double TerrainServerOpenTopo::bilinearInteropolation(double lat, double lon, const CachedDataset& cache)
+{
+    // Find the four nearest grid points
+    double lat_step = (cache.bbox.max_lat - cache.bbox.min_lat) / (cache.grid_lat - 1);
+    double lon_step = (cache.bbox.max_lon - cache.bbox.min_lon) / (cache.grid_lon - 1);
+    
+    // Find grid indices
+    double lat_idx = (lat - cache.bbox.min_lat) / lat_step;
+    double lon_idx = (lon - cache.bbox.min_lon) / lon_step;
+    
+    int lat_i0 = static_cast<int>(std::floor(lat_idx));
+    int lat_i1 = static_cast<int>(std::ceil(lat_idx));
+    int lon_j0 = static_cast<int>(std::floor(lon_idx));
+    int lon_j1 = static_cast<int>(std::ceil(lon_idx));
+    
+    // Clamp to grid bounds
+    lat_i0 = std::max(0, std::min(lat_i0, cache.grid_lat - 1));
+    lat_i1 = std::max(0, std::min(lat_i1, cache.grid_lat - 1));
+    lon_j0 = std::max(0, std::min(lon_j0, cache.grid_lon - 1));
+    lon_j1 = std::max(0, std::min(lon_j1, cache.grid_lon - 1));
+    
+    // Get elevations at four corners
+    auto getElevationAt = [&](int i, int j) -> double {
+        int idx = i * cache.grid_lon + j;
+        if (idx >= 0 && idx < static_cast<int>(cache.points.size()))
+        {
+            return cache.points[idx].alt;
+        }
+        return 0.0;
+    };
+    
+    double z00 = getElevationAt(lat_i0, lon_j0);
+    double z01 = getElevationAt(lat_i0, lon_j1);
+    double z10 = getElevationAt(lat_i1, lon_j0);
+    double z11 = getElevationAt(lat_i1, lon_j1);
+    
+    // If all corners are the same (at edge), return that value
+    if (lat_i0 == lat_i1 && lon_j0 == lon_j1)
+    {
+        return z00;
+    }
+    
+    // Compute interpolation weights
+    double lat_weight = lat_idx - lat_i0;
+    double lon_weight = lon_idx - lon_j0;
+    
+    // Bilinear interpolation
+    double z0 = z00 * (1 - lon_weight) + z01 * lon_weight;
+    double z1 = z10 * (1 - lon_weight) + z11 * lon_weight;
+    double z = z0 * (1 - lat_weight) + z1 * lat_weight;
+    
+    return z;
 }
