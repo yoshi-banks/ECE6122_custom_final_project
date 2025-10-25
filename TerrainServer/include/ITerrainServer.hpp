@@ -7,7 +7,15 @@ struct TerrainPoint
 {
     double lat;
     double lon;
-    double elevation;
+    double alt;
+};
+
+struct BoundingBox 
+{
+    double min_lat;
+    double max_lat;
+    double min_lon;
+    double max_lon;
 };
 
 class ITerrainServer

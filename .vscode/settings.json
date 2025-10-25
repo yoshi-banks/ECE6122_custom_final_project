@@ -1,0 +1,6 @@
+{
+  "files.associations": {
+    "*.to2": "lua",
+    "fstream": "cpp"
+  }
+}
