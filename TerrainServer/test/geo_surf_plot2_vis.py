@@ -4,7 +4,7 @@ from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 from scipy.interpolate import griddata
 
-df = pd.read_csv("../../test_terrain_data.csv")
+df = pd.read_csv("../../high_res_grandcanyon_interpolated.csv")
 
 # make target grid
 lon_lin = np.linspace(df.longitude.min(), df.longitude.max(), 100)

@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 
-df = pd.read_csv("../../high_res_interpolated.csv")
+df = pd.read_csv("../../high_res_grandcanyon_interpolated.csv")
 
 # reshape to 2D grid
 lat = np.sort(df['latitude'].unique())

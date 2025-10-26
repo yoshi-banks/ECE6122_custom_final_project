@@ -246,7 +246,7 @@ std::vector<TerrainPoint> TerrainServerOpenTopo::getTerrainData(const BoundingBo
     return getTerrainDataSmart(bbox, grid_points_lat, grid_points_lon);
 }
 
-std::vector<TerrainPoint> TerrainServerOpenTopo::pygetTerrainDataSmart(const BoundingBox& bbox,
+std::vector<TerrainPoint> TerrainServerOpenTopo::getTerrainDataSmart(const BoundingBox& bbox,
                                                                      int grid_points_lat,
                                                                      int grid_points_lon)
 {
