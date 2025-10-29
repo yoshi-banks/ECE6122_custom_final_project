@@ -37,7 +37,7 @@ set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 
 # Build ogl code
-add_subdirectory(external)
+# add_subdirectory(external)
 
 add_subdirectory(TerrainServer)
 add_subdirectory(TerrainVisualizer)
