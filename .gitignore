@@ -1,0 +1,9 @@
+build/
+venv/
+.venv/
+terrain_cache/
+opentopodata/
+
+*.csv
+*.log
+*.json
